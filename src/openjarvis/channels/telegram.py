@@ -66,6 +66,17 @@ class TelegramChannel(BaseChannel):
         self._loop: Optional[Any] = None
         self._async_stop_event: Optional[asyncio.Event] = None
         self._runtime_lock = threading.Lock()
+        # Speech-to-text backend for inbound voice notes; attached by the
+        # server once speech discovery has run (see set_speech_backend).
+        self._speech_backend: Optional[Any] = None
+        self._speech_language: Optional[str] = None
+
+    def set_speech_backend(
+        self, backend: Optional[Any], *, language: Optional[str] = None
+    ) -> None:
+        """Enable voice-note input by transcribing with *backend*."""
+        self._speech_backend = backend
+        self._speech_language = language or None
 
     # -- connection lifecycle ---------------------------------------------------
 
@@ -242,6 +253,51 @@ class TelegramChannel(BaseChannel):
 
     # -- internal helpers -------------------------------------------------------
 
+    def _chat_allowed(self, chat_id: str) -> bool:
+        """Return whether *chat_id* passes the configured allow-list."""
+        if not self._allowed_chat_ids:
+            return True
+        allowed = {
+            cid.strip() for cid in self._allowed_chat_ids.split(",") if cid.strip()
+        }
+        return chat_id in allowed
+
+    async def _transcribe_voice(self, bot: Any, media: Any, chat_id: str) -> str:
+        """Download a voice note or audio file and return its transcript.
+
+        Returns an empty string, after telling the sender why, when there is
+        no speech backend or nothing intelligible was heard.
+        """
+        backend = self._speech_backend
+        if backend is None:
+            self.send(
+                chat_id,
+                "I can't listen to voice notes yet: no speech-to-text backend "
+                "is available. Please type your message instead.",
+            )
+            return ""
+        try:
+            tg_file = await bot.get_file(media.file_id)
+            audio = bytes(await tg_file.download_as_bytearray())
+            # Voice notes arrive as OGG/Opus (".oga"); audio uploads keep
+            # their own extension. The decoder sniffs the content either way.
+            suffix = os.path.splitext(getattr(tg_file, "file_path", "") or "")[1]
+            fmt = suffix.lstrip(".") or "ogg"
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: backend.transcribe(
+                    audio, format=fmt, language=self._speech_language
+                ),
+            )
+            text = (result.text or "").strip()
+        except Exception:
+            logger.exception("Telegram voice note transcription failed")
+            self.send(chat_id, "Sorry, I couldn't process that voice note.")
+            return ""
+        if not text:
+            self.send(chat_id, "I couldn't hear anything in that voice note.")
+        return text
+
     def _stop_requested(self, async_stop_event: asyncio.Event) -> bool:
         return self._stop_event.is_set() or async_stop_event.is_set()
 
@@ -387,26 +443,25 @@ class TelegramChannel(BaseChannel):
                 msg = update.message
                 if msg is None:
                     return
+                chat_id = str(msg.chat.id)
+                # Enforce the allow-list before any work, so an unlisted chat
+                # cannot make this machine download or transcribe audio.
+                if not self._chat_allowed(chat_id):
+                    logger.debug("Ignoring message from unlisted chat %s", chat_id)
+                    return
+                content = msg.text or ""
+                media = getattr(msg, "voice", None) or getattr(msg, "audio", None)
+                if media is not None:
+                    content = await self._transcribe_voice(context.bot, media, chat_id)
+                    if not content:
+                        return
                 cm = ChannelMessage(
                     channel="telegram",
                     sender=str(msg.from_user.id) if msg.from_user else "",
-                    content=msg.text or "",
+                    content=content,
                     message_id=str(msg.message_id),
-                    conversation_id=str(msg.chat.id),
+                    conversation_id=chat_id,
                 )
-                # Enforce allow-list when configured
-                if self._allowed_chat_ids:
-                    _allowed = {
-                        cid.strip()
-                        for cid in self._allowed_chat_ids.split(",")
-                        if cid.strip()
-                    }
-                    if cm.conversation_id not in _allowed:
-                        logger.debug(
-                            "Ignoring message from unlisted chat %s",
-                            cm.conversation_id,
-                        )
-                        return
                 for handler in self._handlers:
                     try:
                         handler(cm)
@@ -423,7 +478,11 @@ class TelegramChannel(BaseChannel):
                         },
                     )
 
-            app.add_handler(MessageHandler(filters.TEXT, _handle_msg))
+            app.add_handler(
+                MessageHandler(
+                    filters.TEXT | filters.VOICE | filters.AUDIO, _handle_msg
+                )
+            )
             loop.run_until_complete(self._run_polling_lifecycle(app, async_stop_event))
         except Exception:
             logger.debug("Telegram poll loop error", exc_info=True)

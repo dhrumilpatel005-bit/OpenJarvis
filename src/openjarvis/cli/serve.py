@@ -528,6 +528,14 @@ def serve(
         speech_backend = get_speech_backend(config)
         if speech_backend:
             console.print(f"  Speech: [cyan]{speech_backend.backend_id}[/cyan]")
+            # Channels that accept voice input (Telegram voice notes)
+            # transcribe with the same backend as the speech API.
+            if channel_bridge is not None and hasattr(
+                channel_bridge, "set_speech_backend"
+            ):
+                channel_bridge.set_speech_backend(
+                    speech_backend, language=config.speech.language
+                )
     except Exception as exc:
         logger.debug("Speech backend discovery failed: %s", exc)
 

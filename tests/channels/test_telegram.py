@@ -62,7 +62,7 @@ def test_configured_allowlist_gates_handlers_and_events(
     telegram_ext = SimpleNamespace(
         ApplicationBuilder=lambda: builder,
         MessageHandler=lambda _filters, callback: SimpleNamespace(callback=callback),
-        filters=SimpleNamespace(TEXT=object()),
+        filters=MagicMock(),
     )
     monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
 
@@ -385,7 +385,7 @@ class TestDisconnectStopsRealListener:
         telegram_ext = SimpleNamespace(
             ApplicationBuilder=FakeBuilder,
             MessageHandler=lambda *args: args,
-            filters=SimpleNamespace(TEXT=object()),
+            filters=MagicMock(),
         )
         ch = TelegramChannel(bot_token="123:ABC")
 
@@ -494,7 +494,7 @@ class TestDisconnectStopsRealListener:
         telegram_ext = SimpleNamespace(
             ApplicationBuilder=FakeBuilder,
             MessageHandler=lambda *args: args,
-            filters=SimpleNamespace(TEXT=object()),
+            filters=MagicMock(),
         )
 
         def make_event_loop():
@@ -595,7 +595,7 @@ class TestDisconnectStopsRealListener:
         telegram_ext = SimpleNamespace(
             ApplicationBuilder=FakeBuilder,
             MessageHandler=lambda *args: args,
-            filters=SimpleNamespace(TEXT=object()),
+            filters=MagicMock(),
         )
         ch = TelegramChannel(bot_token="123:ABC")
 
@@ -764,3 +764,125 @@ class TestChannelAgentWiring:
 
         assert len(calls_a) == 1
         assert len(calls_b) == 1
+
+
+class TestVoiceNotes:
+    """Inbound voice notes are transcribed and dispatched as text."""
+
+    @staticmethod
+    def _deliver(monkeypatch, channel, message, bot):
+        handlers = []
+        app = SimpleNamespace(add_handler=handlers.append)
+        builder = MagicMock()
+        builder.token.return_value = builder
+        builder.build.return_value = app
+        telegram_ext = SimpleNamespace(
+            ApplicationBuilder=lambda: builder,
+            MessageHandler=lambda _filters, callback: SimpleNamespace(
+                callback=callback
+            ),
+            filters=MagicMock(),
+        )
+        monkeypatch.setitem(sys.modules, "telegram.ext", telegram_ext)
+
+        async def deliver(_app, _stop):
+            update = SimpleNamespace(message=message)
+            await handlers[0].callback(update, SimpleNamespace(bot=bot))
+
+        monkeypatch.setattr(channel, "_run_polling_lifecycle", deliver)
+        channel._poll_loop()
+
+    @staticmethod
+    def _voice_message(chat_id=111):
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=chat_id),
+            text=None,
+            voice=SimpleNamespace(file_id="voice-1"),
+            audio=None,
+            message_id=7,
+            chat=SimpleNamespace(id=chat_id),
+        )
+
+    @staticmethod
+    def _bot(audio=b"OggS-audio", file_path="voice/file_1.oga"):
+        tg_file = MagicMock(file_path=file_path)
+
+        async def download_as_bytearray():
+            return bytearray(audio)
+
+        tg_file.download_as_bytearray = download_as_bytearray
+        bot = MagicMock()
+
+        async def get_file(file_id):
+            bot.requested_file_id = file_id
+            return tg_file
+
+        bot.get_file = MagicMock(side_effect=get_file)
+        return bot
+
+    def test_voice_note_is_transcribed_and_dispatched(self, monkeypatch):
+        ch = TelegramChannel(bot_token="tok", allowed_chat_ids="111")
+        backend = MagicMock()
+        backend.transcribe.return_value = SimpleNamespace(text="  hey jarvis  ")
+        ch.set_speech_backend(backend, language="en")
+        received = []
+        ch.on_message(received.append)
+        bot = self._bot()
+
+        self._deliver(monkeypatch, ch, self._voice_message(), bot)
+
+        assert bot.requested_file_id == "voice-1"
+        backend.transcribe.assert_called_once_with(
+            b"OggS-audio", format="oga", language="en"
+        )
+        assert [m.content for m in received] == ["hey jarvis"]
+        assert received[0].conversation_id == "111"
+
+    def test_voice_note_without_backend_explains_and_skips(self, monkeypatch):
+        ch = TelegramChannel(bot_token="tok")
+        received = []
+        ch.on_message(received.append)
+        bot = self._bot()
+
+        with patch.object(ch, "send") as send:
+            self._deliver(monkeypatch, ch, self._voice_message(), bot)
+
+        assert received == []
+        bot.get_file.assert_not_called()
+        assert send.call_args.args[0] == "111"
+        assert "voice notes" in send.call_args.args[1]
+
+    def test_unlisted_chat_voice_note_is_not_downloaded(self, monkeypatch):
+        ch = TelegramChannel(bot_token="tok", allowed_chat_ids="111")
+        backend = MagicMock()
+        ch.set_speech_backend(backend)
+        received = []
+        ch.on_message(received.append)
+        bot = self._bot()
+
+        with patch.object(ch, "send") as send:
+            self._deliver(monkeypatch, ch, self._voice_message(chat_id=999), bot)
+
+        assert received == []
+        bot.get_file.assert_not_called()
+        backend.transcribe.assert_not_called()
+        send.assert_not_called()
+
+    @pytest.mark.parametrize("failure", ["empty", "error"])
+    def test_unusable_transcript_is_reported_not_dispatched(self, monkeypatch, failure):
+        ch = TelegramChannel(bot_token="tok")
+        backend = MagicMock()
+        if failure == "empty":
+            backend.transcribe.return_value = SimpleNamespace(text="   ")
+        else:
+            backend.transcribe.side_effect = RuntimeError("decoder failed")
+        ch.set_speech_backend(backend)
+        received = []
+        ch.on_message(received.append)
+
+        with patch.object(ch, "send") as send:
+            self._deliver(monkeypatch, ch, self._voice_message(), self._bot())
+
+        assert received == []
+        send.assert_called_once()
+        assert send.call_args.args[0] == "111"
