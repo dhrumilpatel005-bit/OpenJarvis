@@ -1258,6 +1258,8 @@ class TelegramChannelConfig:
     bot_token: str = ""
     allowed_chat_ids: str = ""
     parse_mode: str = "Markdown"
+    # Answer voice notes with a spoken voice note too (needs a TTS backend).
+    voice_replies: bool = True
 
 
 @dataclass(slots=True)

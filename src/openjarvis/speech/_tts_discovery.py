@@ -76,10 +76,23 @@ def voice_preferences(config: "JarvisConfig") -> tuple[str, str, float]:
     )
 
 
+def voice_pitch(config: "JarvisConfig") -> float:
+    """Resolve ``speech.voice_pitch``, clamped to 0.5-1.5 (1.0 if invalid)."""
+    speech = getattr(config, "speech", None)
+    try:
+        pitch = float(getattr(speech, "voice_pitch", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    if pitch != pitch:  # NaN
+        return 1.0
+    return min(1.5, max(0.5, pitch))
+
+
 __all__ = [
     "BACKEND_DEFAULT_VOICE",
     "TTS_BACKEND_ORDER",
     "default_voice_for",
     "get_tts_backend",
+    "voice_pitch",
     "voice_preferences",
 ]

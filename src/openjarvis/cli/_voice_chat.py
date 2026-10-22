@@ -130,15 +130,10 @@ class VoiceSession:
     def get_voice_pitch(self) -> float:
         """Return the configured playback pitch, clamped to 0.5-1.5."""
         from openjarvis.core.config import load_config
+        from openjarvis.speech._tts_discovery import voice_pitch
 
         config = self._config if self._config is not None else load_config()
-        try:
-            pitch = float(getattr(config.speech, "voice_pitch", 1.0))
-        except (TypeError, ValueError):
-            return 1.0
-        if pitch != pitch:  # NaN
-            return 1.0
-        return min(1.5, max(0.5, pitch))
+        return voice_pitch(config)
 
     def synth_kwargs(self, backend: Any, console: Any = None) -> dict[str, Any]:
         """Synthesis arguments for *backend*, pre-compensated for pitch.

@@ -536,6 +536,14 @@ def serve(
                 channel_bridge.set_speech_backend(
                     speech_backend, language=config.speech.language
                 )
+            if channel_bridge is not None and hasattr(
+                channel_bridge, "set_voice_synthesizer"
+            ):
+                from openjarvis.speech.voice_note import make_voice_note_synthesizer
+
+                channel_bridge.set_voice_synthesizer(
+                    make_voice_note_synthesizer(config)
+                )
     except Exception as exc:
         logger.debug("Speech backend discovery failed: %s", exc)
 

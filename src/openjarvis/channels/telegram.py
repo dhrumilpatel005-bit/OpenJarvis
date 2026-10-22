@@ -7,7 +7,8 @@ import logging
 import os
 import textwrap
 import threading
-from typing import Any, Dict, List, Optional
+from collections import OrderedDict
+from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.channels._stubs import (
     BaseChannel,
@@ -19,6 +20,10 @@ from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.registry import ChannelRegistry
 
 logger = logging.getLogger(__name__)
+
+# Voice-note message ids awaiting a spoken reply. Bounded so replies that
+# never come (agent errors) cannot grow the map without limit.
+_MAX_PENDING_VOICE_REPLIES = 100
 
 
 @ChannelRegistry.register("telegram")
@@ -33,6 +38,9 @@ class TelegramChannel(BaseChannel):
         Comma-separated list of chat IDs allowed to interact.
     parse_mode:
         Message parse mode (``Markdown``, ``HTML``, etc.).
+    voice_replies:
+        Answer voice notes with a spoken voice note as well as text, once a
+        synthesizer is attached (see ``set_voice_synthesizer``).
     bus:
         Optional event bus for publishing channel events.
     """
@@ -45,6 +53,7 @@ class TelegramChannel(BaseChannel):
         *,
         allowed_chat_ids: str = "",
         parse_mode: str = "Markdown",
+        voice_replies: bool = True,
         bus: Optional[EventBus] = None,
     ) -> None:
         self._token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -70,6 +79,10 @@ class TelegramChannel(BaseChannel):
         # server once speech discovery has run (see set_speech_backend).
         self._speech_backend: Optional[Any] = None
         self._speech_language: Optional[str] = None
+        self._voice_replies = voice_replies
+        self._voice_synthesizer: Optional[Callable[[str], Optional[bytes]]] = None
+        self._pending_voice_replies: OrderedDict[str, None] = OrderedDict()
+        self._pending_lock = threading.Lock()
 
     def set_speech_backend(
         self, backend: Optional[Any], *, language: Optional[str] = None
@@ -77,6 +90,12 @@ class TelegramChannel(BaseChannel):
         """Enable voice-note input by transcribing with *backend*."""
         self._speech_backend = backend
         self._speech_language = language or None
+
+    def set_voice_synthesizer(
+        self, synthesizer: Optional[Callable[[str], Optional[bytes]]]
+    ) -> None:
+        """Enable spoken replies: *synthesizer* maps text to OGG/Opus bytes."""
+        self._voice_synthesizer = synthesizer
 
     # -- connection lifecycle ---------------------------------------------------
 
@@ -234,10 +253,51 @@ class TelegramChannel(BaseChannel):
                         )
                         return False
             self._publish_sent(channel, content, conversation_id)
+            if reply_to and self._take_pending_voice_reply(reply_to):
+                self._send_voice(chat_id, content, reply_to)
             return True
         except Exception:
             logger.debug("Telegram send failed", exc_info=True)
             return False
+
+    def _take_pending_voice_reply(self, message_id: str) -> bool:
+        with self._pending_lock:
+            if message_id not in self._pending_voice_replies:
+                return False
+            del self._pending_voice_replies[message_id]
+            return True
+
+    def _send_voice(self, chat_id: str, content: str, reply_to: str) -> None:
+        """Speak *content* back as a voice note; failures only cost the audio."""
+        synthesizer = self._voice_synthesizer
+        if synthesizer is None:
+            return
+        try:
+            audio = synthesizer(content)
+        except Exception:
+            logger.warning("Voice reply synthesis failed", exc_info=True)
+            return
+        if not audio:
+            return
+        try:
+            import httpx
+
+            resp = httpx.post(
+                f"https://api.telegram.org/bot{self._token}/sendVoice",
+                data={"chat_id": chat_id, "reply_to_message_id": reply_to},
+                files={"voice": ("reply.ogg", audio, "audio/ogg")},
+                timeout=60.0,
+            )
+        except Exception as exc:
+            # httpx errors embed the request URL, which carries the bot token.
+            logger.warning("Telegram sendVoice failed: %s", type(exc).__name__)
+            return
+        if resp.status_code >= 300:
+            logger.warning(
+                "Telegram sendVoice returned status %d: %s",
+                resp.status_code,
+                resp.text,
+            )
 
     def status(self) -> ChannelStatus:
         """Return the current connection status."""
@@ -455,6 +515,12 @@ class TelegramChannel(BaseChannel):
                     content = await self._transcribe_voice(context.bot, media, chat_id)
                     if not content:
                         return
+                    if self._voice_replies and self._voice_synthesizer is not None:
+                        with self._pending_lock:
+                            pending = self._pending_voice_replies
+                            pending[str(msg.message_id)] = None
+                            while len(pending) > _MAX_PENDING_VOICE_REPLIES:
+                                pending.popitem(last=False)
                 cm = ChannelMessage(
                     channel="telegram",
                     sender=str(msg.from_user.id) if msg.from_user else "",

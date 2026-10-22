@@ -886,3 +886,114 @@ class TestVoiceNotes:
         assert received == []
         send.assert_called_once()
         assert send.call_args.args[0] == "111"
+
+
+class TestVoiceReplies:
+    """Voice notes are answered with a spoken voice note as well as text."""
+
+    @staticmethod
+    def _ok(*args, **kwargs):
+        return MagicMock(status_code=200, text="ok")
+
+    def _channel_with_pending(self, monkeypatch, *, voice_replies=True):
+        ch = TelegramChannel(bot_token="tok", voice_replies=voice_replies)
+        backend = MagicMock()
+        backend.transcribe.return_value = SimpleNamespace(text="price of nvidia")
+        ch.set_speech_backend(backend)
+        synth = MagicMock(return_value=b"OggS-reply")
+        ch.set_voice_synthesizer(synth)
+        TestVoiceNotes._deliver(
+            monkeypatch, ch, TestVoiceNotes._voice_message(), TestVoiceNotes._bot()
+        )
+        return ch, synth
+
+    def test_reply_to_voice_note_also_sends_voice(self, monkeypatch):
+        ch, synth = self._channel_with_pending(monkeypatch)
+
+        with patch("httpx.post", side_effect=self._ok) as post:
+            assert ch.send("111", "NVDA is up.", conversation_id="7")
+
+        urls = [c.args[0] for c in post.call_args_list]
+        assert urls[0].endswith("/sendMessage")
+        assert urls[1].endswith("/sendVoice")
+        voice_call = post.call_args_list[1]
+        assert voice_call.kwargs["data"] == {
+            "chat_id": "111",
+            "reply_to_message_id": "7",
+        }
+        assert voice_call.kwargs["files"]["voice"][1] == b"OggS-reply"
+        synth.assert_called_once_with("NVDA is up.")
+
+        # Only the first reply to that voice note is spoken.
+        with patch("httpx.post", side_effect=self._ok) as post:
+            ch.send("111", "Anything else?", conversation_id="7")
+        assert len(post.call_args_list) == 1
+
+    def test_reply_to_text_message_is_not_voiced(self, monkeypatch):
+        ch, synth = self._channel_with_pending(monkeypatch)
+        with patch("httpx.post", side_effect=self._ok) as post:
+            ch.send("111", "Hello.", conversation_id="8")
+        assert len(post.call_args_list) == 1
+        synth.assert_not_called()
+
+    def test_voice_replies_can_be_disabled(self, monkeypatch):
+        ch, synth = self._channel_with_pending(monkeypatch, voice_replies=False)
+        with patch("httpx.post", side_effect=self._ok) as post:
+            ch.send("111", "NVDA is up.", conversation_id="7")
+        assert len(post.call_args_list) == 1
+        synth.assert_not_called()
+
+    @pytest.mark.parametrize("outcome", ["nothing", "error"])
+    def test_synthesis_problems_keep_the_text_reply(self, monkeypatch, outcome):
+        ch, synth = self._channel_with_pending(monkeypatch)
+        if outcome == "nothing":
+            synth.return_value = None
+        else:
+            synth.side_effect = RuntimeError("tts down")
+        with patch("httpx.post", side_effect=self._ok) as post:
+            assert ch.send("111", "NVDA is up.", conversation_id="7")
+        assert [c.args[0].rsplit("/", 1)[-1] for c in post.call_args_list] == [
+            "sendMessage"
+        ]
+
+    def test_pending_voice_replies_are_bounded(self, monkeypatch):
+        from openjarvis.channels import telegram as telegram_mod
+
+        monkeypatch.setattr(telegram_mod, "_MAX_PENDING_VOICE_REPLIES", 2)
+        ch, _ = self._channel_with_pending(monkeypatch)
+        for message_id in (8, 9):
+            message = TestVoiceNotes._voice_message()
+            message.message_id = message_id
+            TestVoiceNotes._deliver(monkeypatch, ch, message, TestVoiceNotes._bot())
+        assert list(ch._pending_voice_replies) == ["8", "9"]
+
+    def test_config_flag_reaches_the_adapter(self, tmp_path):
+        from openjarvis.core.config import load_config
+        from openjarvis.system.builder import SystemBuilder
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            '[channel]\nenabled = true\ndefault_channel = "telegram"\n'
+            '[channel.telegram]\nbot_token = "t"\nvoice_replies = false\n'
+        )
+        cfg = load_config(config_path)
+        channel = SystemBuilder(config=cfg)._resolve_channel(cfg, EventBus())
+        assert channel._voice_replies is False
+
+
+def test_voice_send_failure_does_not_log_the_bot_token(monkeypatch, caplog):
+    ch, _ = TestVoiceReplies()._channel_with_pending(monkeypatch)
+    secret_url = "https://api.telegram.org/botSECRET-TOKEN/sendVoice"
+
+    def post(url, **kwargs):
+        if url.endswith("/sendVoice"):
+            raise httpx.ConnectError(f"failed to connect to {secret_url}")
+        return MagicMock(status_code=200, text="ok")
+
+    import httpx
+
+    ch._token = "SECRET-TOKEN"
+    with caplog.at_level("DEBUG"), patch("httpx.post", side_effect=post):
+        assert ch.send("111", "NVDA is up.", conversation_id="7")
+    assert "SECRET-TOKEN" not in caplog.text
+    assert "ConnectError" in caplog.text

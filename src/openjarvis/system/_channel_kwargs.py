@@ -15,6 +15,7 @@ def _telegram(c: Any) -> Dict[str, Any]:
     # allowed_chat_ids setting was silently ignored.
     if getattr(c, "allowed_chat_ids", ""):
         kw["allowed_chat_ids"] = c.allowed_chat_ids
+    kw["voice_replies"] = bool(getattr(c, "voice_replies", True))
     return kw
 
 
