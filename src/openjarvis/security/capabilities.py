@@ -273,6 +273,7 @@ DEFAULT_TOOL_CAPABILITIES: Dict[str, List[str]] = {
     "schedule_task": [Capability.SCHEDULE_CREATE],
     "shell_exec": [Capability.CODE_EXECUTE],
     "skill_manage": [Capability.FILE_READ, Capability.FILE_WRITE],
+    "stock_quote": [Capability.NETWORK_FETCH],
     "text_to_speech": [Capability.NETWORK_FETCH, Capability.FILE_WRITE],
     "think": [],
     "user_profile_manage": [Capability.FILE_READ, Capability.FILE_WRITE],

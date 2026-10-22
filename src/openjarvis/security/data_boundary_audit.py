@@ -223,7 +223,7 @@ BROWSER_TOOLS = {
 }
 GENERIC_NETWORK_TOOLS = {"http_request"}
 WEATHER_TOOLS = {"get_weather"}
-MARKET_DATA_TOOLS = {"fx_macro_data"}
+MARKET_DATA_TOOLS = {"fx_macro_data", "stock_quote"}
 CHANNEL_OUTBOUND_TOOLS = {"channel_send"}
 CONNECTOR_NETWORK_TOOLS = {"digest_collect", "execute_pending_actions"}
 CLOUD_MEDIA_TOOLS = {"audio_transcribe", "image_generate", "text_to_speech"}
@@ -1035,13 +1035,15 @@ def _audit_tool_surfaces(config: Any, builder: _FindingBuilder) -> None:
             status="warn",
             title="External market data lookup tool is configured",
             potential_data_path=(
-                "currency, indicator and date arguments -> FXMacroData API"
+                "currency, indicator, ticker and date arguments -> "
+                "FXMacroData / Yahoo Finance APIs"
             ),
             evidence=(
                 f"configured tool(s) = {_format_tools(tools & MARKET_DATA_TOOLS)}"
             ),
             recommendation=(
-                "Only currency codes, indicator names and dates leave the machine; "
+                "Only currency codes, indicator names, ticker symbols and dates "
+                "leave the machine; "
                 "keep the tool disabled if no external lookup is wanted."
             ),
         )
