@@ -173,6 +173,96 @@ def record_voice(
         return None
 
 
+_GREETING_WORDS = frozenset({"hey", "hi", "hello", "ok", "okay", "yo", "oh"})
+# Transcription often bends a name slightly ("Javis", "Jarvis's"); accept
+# close spellings but not different words ("Travis" scores ~0.67).
+_WAKE_MATCH_RATIO = 0.8
+
+
+def extract_wake_request(transcript: str, wake_word: str) -> Optional[str]:
+    """Return what was asked of the assistant, or None if it wasn't addressed.
+
+    ``"Hey Jarvis, what time is it?"`` -> ``"what time is it?"``;
+    ``"What time is it, Jarvis?"`` -> ``"What time is it"``;
+    ``"Hey Jarvis"`` -> ``""`` (addressed, request still to come);
+    ``"Pass the salt"`` -> ``None``.
+    """
+    import difflib
+    import re
+
+    target = (re.findall(r"[a-z']+", wake_word.lower()) or [""])[-1]
+    if not target:
+        return None
+    for match in re.finditer(r"[A-Za-z']+", transcript):
+        word = match.group().lower().removesuffix("'s")
+        if difflib.SequenceMatcher(None, word, target).ratio() < _WAKE_MATCH_RATIO:
+            continue
+        after = transcript[match.end() :].lstrip(" \t,.!?;:-").rstrip()
+        if re.search(r"[A-Za-z0-9]", after):
+            return after
+        before = transcript[: match.start()]
+        words = re.findall(r"[A-Za-z0-9']+", before)
+        if all(w.lower() in _GREETING_WORDS for w in words):
+            return ""
+        return before.strip(" \t,.!?;:-")
+    return None
+
+
+def listen_for_wake_word(
+    console: Any,
+    session: VoiceSession,
+    wake_word: str,
+) -> Optional[str] | object:
+    """Stay on standby until addressed by *wake_word*, then return the request.
+
+    Every utterance is transcribed locally and discarded unless it mentions
+    the wake word. Saying only the wake word gets a spoken acknowledgement
+    and a fresh recording for the request itself.
+    """
+    from openjarvis.speech.voice_io import record_until_silence
+
+    backend = session.get_stt_backend()
+    if backend is None:
+        console.print(
+            "[red]No speech-to-text backend available, so standby mode "
+            "cannot listen for the wake word.[/red]"
+        )
+        return VOICE_EXIT
+
+    console.print(
+        f"[dim cyan]Standby: say '{_terminal_safe_text(wake_word)}' "
+        "to wake me (Ctrl+C to quit).[/dim cyan]"
+    )
+    while True:
+        try:
+            audio_bytes = record_until_silence(wait_for_speech=True)
+        except KeyboardInterrupt:
+            return VOICE_EXIT
+        except Exception as exc:
+            console.print(f"[red]Mic error: {_terminal_safe_text(exc)}[/red]")
+            return VOICE_EXIT
+
+        try:
+            result = backend.transcribe(
+                audio_bytes, format="wav", language=session.get_stt_language()
+            )
+        except Exception as exc:
+            console.print(f"[red]Transcription error: {_terminal_safe_text(exc)}[/red]")
+            continue
+
+        request = extract_wake_request(result.text or "", wake_word)
+        if request is None:
+            continue
+        if request:
+            console.print(f"[bold]You (voice):[/bold] {_terminal_safe_text(request)}")
+            return request
+
+        speak("Yes?", console, session)
+        follow_up = record_voice(console, session)
+        if follow_up is not None:
+            return follow_up
+
+
 def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     """Synthesize and play text, reusing a healthy backend for the session."""
     from openjarvis.speech.voice_io import play_wav
@@ -211,4 +301,12 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     )
 
 
-__all__ = ["VOICE_EXIT", "VoiceSession", "read_voice_input", "record_voice", "speak"]
+__all__ = [
+    "VOICE_EXIT",
+    "VoiceSession",
+    "extract_wake_request",
+    "listen_for_wake_word",
+    "read_voice_input",
+    "record_voice",
+    "speak",
+]

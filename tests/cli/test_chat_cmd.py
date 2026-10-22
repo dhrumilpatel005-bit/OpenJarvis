@@ -747,3 +747,125 @@ class TestChatAgents:
         assert "chat executed!" not in result.output
         assert "Confirm:" not in result.output
         assert limiter.keys == ["tool_chat_agent:dangerous_chat"]
+
+
+class TestWakeWord:
+    """Standby mode: only utterances addressed to the wake word get through."""
+
+    @pytest.mark.parametrize(
+        ("transcript", "expected"),
+        [
+            ("Hey Jarvis, what time is it?", "what time is it?"),
+            ("Jarvis tell me a joke.", "tell me a joke."),
+            ("What's the weather, Jarvis?", "What's the weather"),
+            ("Hey Jarvis.", ""),
+            ("Okay, Jarvis!", ""),
+            ("Hey Javis, open my notes", "open my notes"),
+            ("Travis is coming over later", None),
+            ("Pass the salt please", None),
+            ("", None),
+        ],
+    )
+    def test_extract_wake_request(self, transcript, expected) -> None:
+        from openjarvis.cli._voice_chat import extract_wake_request
+
+        assert extract_wake_request(transcript, "Jarvis") == expected
+
+    def test_multi_word_wake_phrase_matches_on_its_name(self) -> None:
+        from openjarvis.cli._voice_chat import extract_wake_request
+
+        assert extract_wake_request("hey jarvis, lights", "Hey Jarvis") == "lights"
+
+    @staticmethod
+    def _session(transcripts):
+        backend = MagicMock()
+        backend.transcribe.side_effect = [
+            SimpleNamespace(text=text) for text in transcripts
+        ]
+        session = VoiceSession(JarvisConfig())
+        return backend, session
+
+    def test_ignores_chatter_until_addressed(self) -> None:
+        from openjarvis.cli._voice_chat import listen_for_wake_word
+
+        backend, session = self._session(
+            ["just talking to myself", "Jarvis, set a timer"]
+        )
+        with (
+            patch(
+                "openjarvis.speech._discovery.get_speech_backend",
+                return_value=backend,
+            ),
+            patch(
+                "openjarvis.speech.voice_io.record_until_silence",
+                return_value=b"wav",
+            ) as record,
+            patch("openjarvis.cli._voice_chat.speak") as speak_mock,
+        ):
+            result = listen_for_wake_word(MagicMock(), session, "Jarvis")
+
+        assert result == "set a timer"
+        assert record.call_count == 2
+        assert all(c.kwargs == {"wait_for_speech": True} for c in record.mock_calls)
+        speak_mock.assert_not_called()
+
+    def test_bare_wake_word_acknowledges_then_records_request(self) -> None:
+        from openjarvis.cli._voice_chat import listen_for_wake_word
+
+        backend, session = self._session(["Hey Jarvis", "what's on today"])
+        with (
+            patch(
+                "openjarvis.speech._discovery.get_speech_backend",
+                return_value=backend,
+            ),
+            patch(
+                "openjarvis.speech.voice_io.record_until_silence",
+                return_value=b"wav",
+            ),
+            patch("openjarvis.cli._voice_chat.speak") as speak_mock,
+        ):
+            result = listen_for_wake_word(MagicMock(), session, "Jarvis")
+
+        assert result == "what's on today"
+        assert speak_mock.call_args.args[0] == "Yes?"
+
+    def test_ctrl_c_on_standby_exits(self) -> None:
+        from openjarvis.cli._voice_chat import listen_for_wake_word
+
+        backend, session = self._session([])
+        with (
+            patch(
+                "openjarvis.speech._discovery.get_speech_backend",
+                return_value=backend,
+            ),
+            patch(
+                "openjarvis.speech.voice_io.record_until_silence",
+                side_effect=KeyboardInterrupt,
+            ),
+        ):
+            assert listen_for_wake_word(MagicMock(), session, "Jarvis") is VOICE_EXIT
+
+    def test_standby_flag_routes_input_through_wake_word(self) -> None:
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch(
+                "openjarvis.cli.chat_cmd.listen_for_wake_word",
+                return_value=VOICE_EXIT,
+            ) as listen,
+            patch("openjarvis.cli.chat_cmd.read_voice_input") as read_input,
+        ):
+            result = CliRunner().invoke(
+                chat, ["--standby", "--wake-word", "Friday", "--model", "test-model"]
+            )
+
+        assert result.exit_code == 0
+        assert "Standby mode ON" in result.output
+        assert listen.call_args.args[2] == "Friday"
+        read_input.assert_not_called()

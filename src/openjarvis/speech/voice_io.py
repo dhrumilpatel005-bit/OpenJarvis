@@ -12,6 +12,7 @@ _SILENCE_THRESHOLD = 500  # RMS below this → silence
 _SILENCE_SECONDS = 1.5  # seconds of silence before auto-stop
 _STARTUP_SILENCE_SECONDS = 5.0  # give up early if speech never begins
 _MAX_RECORD_SECONDS = 30  # safety ceiling
+_PREROLL_SECONDS = 0.3  # audio kept from before speech onset (wait_for_speech)
 
 
 def _rms(data: bytes) -> float:
@@ -32,8 +33,13 @@ def record_until_silence(
     silence_seconds: float = _SILENCE_SECONDS,
     startup_silence_seconds: float = _STARTUP_SILENCE_SECONDS,
     max_seconds: float = _MAX_RECORD_SECONDS,
+    wait_for_speech: bool = False,
 ) -> bytes:
     """Record from the default microphone until silence is detected.
+
+    With ``wait_for_speech`` the call blocks until speech begins instead of
+    giving up after ``startup_silence_seconds``; only a short pre-roll of the
+    quiet before it is kept, and ``max_seconds`` counts from speech onset.
 
     Returns raw WAV bytes (16-bit mono).
     Raises RuntimeError if sounddevice is not installed.
@@ -51,6 +57,8 @@ def record_until_silence(
     startup_silence_chunks = max(1, int(startup_silence_seconds * chunks_per_second))
     max_chunks = int(max_seconds * chunks_per_second)
 
+    preroll_chunks = max(1, int(_PREROLL_SECONDS * chunks_per_second))
+
     frames: list[bytes] = []
     silence_count = 0
     has_speech = False
@@ -61,6 +69,16 @@ def record_until_silence(
         dtype="int16",
         blocksize=_CHUNK,
     ) as stream:
+        while wait_for_speech:
+            raw, _ = stream.read(_CHUNK)
+            data = bytes(raw)
+            frames.append(data)
+            if _rms(data) > silence_threshold:
+                has_speech = True
+                break
+            # Keep just enough lead-in that the first syllable isn't clipped.
+            del frames[:-preroll_chunks]
+
         for _ in range(max_chunks):
             raw, _ = stream.read(_CHUNK)
             data = bytes(raw)
