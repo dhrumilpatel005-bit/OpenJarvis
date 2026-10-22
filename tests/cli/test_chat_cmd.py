@@ -783,6 +783,7 @@ class TestWakeWord:
             SimpleNamespace(text=text) for text in transcripts
         ]
         session = VoiceSession(JarvisConfig())
+        session._warmed = True  # warm-up is covered by its own test
         return backend, session
 
     def test_ignores_chatter_until_addressed(self) -> None:
@@ -828,6 +829,69 @@ class TestWakeWord:
 
         assert result == "what's on today"
         assert speak_mock.call_args.args[0] == "Yes?"
+
+    def test_warm_up_preloads_models_and_replays_cached_acknowledgement(
+        self,
+    ) -> None:
+        from openjarvis.cli._voice_chat import listen_for_wake_word
+
+        stt = MagicMock()
+        stt.transcribe.side_effect = [
+            SimpleNamespace(text=""),  # warm-up pass on silence
+            SimpleNamespace(text="Hey Jarvis"),
+            SimpleNamespace(text="lights off"),
+        ]
+        tts = MagicMock(backend_id="kokoro")
+        tts.synthesize.return_value = SimpleNamespace(
+            audio=b"yes-wav", sample_rate=24000
+        )
+        session = VoiceSession(JarvisConfig())
+        with (
+            patch(
+                "openjarvis.speech._discovery.get_speech_backend",
+                return_value=stt,
+            ),
+            patch(
+                "openjarvis.speech._tts_discovery.get_tts_backend",
+                return_value=tts,
+            ),
+            patch(
+                "openjarvis.speech.voice_io.record_until_silence",
+                return_value=b"wav",
+            ),
+            patch("openjarvis.speech.voice_io.play_wav") as play,
+            patch("openjarvis.cli._voice_chat.speak") as speak_mock,
+        ):
+            assert listen_for_wake_word(MagicMock(), session, "Jarvis") == "lights off"
+            # A second standby round does not reload or re-synthesize.
+            stt.transcribe.side_effect = [SimpleNamespace(text="Jarvis, hi there")]
+            assert listen_for_wake_word(MagicMock(), session, "Jarvis") == "hi there"
+
+        assert tts.synthesize.call_count == 1
+        assert tts.synthesize.call_args.args[0] == "Yes?"
+        play.assert_called_once_with(b"yes-wav", sample_rate=24000)
+        speak_mock.assert_not_called()
+
+    def test_silent_follow_up_returns_to_announced_standby(self) -> None:
+        from openjarvis.cli._voice_chat import listen_for_wake_word
+
+        backend, session = self._session(["Hey Jarvis", "", "Jarvis, go"])
+        console = MagicMock()
+        with (
+            patch(
+                "openjarvis.speech._discovery.get_speech_backend",
+                return_value=backend,
+            ),
+            patch(
+                "openjarvis.speech.voice_io.record_until_silence",
+                return_value=b"wav",
+            ),
+            patch("openjarvis.cli._voice_chat.speak"),
+        ):
+            assert listen_for_wake_word(console, session, "Jarvis") == "go"
+
+        printed = [str(c.args[0]) for c in console.print.call_args_list]
+        assert sum("Standby:" in line for line in printed) == 2
 
     def test_ctrl_c_on_standby_exits(self) -> None:
         from openjarvis.cli._voice_chat import listen_for_wake_word

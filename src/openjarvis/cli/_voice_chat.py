@@ -46,6 +46,51 @@ class VoiceSession:
         self._tts_attempted: set[str] = set()
         self._voice_prefs: tuple[str, str, float] | None = None
         self._voice_warned: set[str] = set()
+        self._warmed = False
+        # Pre-synthesized standby acknowledgement as (wav_bytes, sample_rate).
+        self.ack_audio: tuple[bytes, int] | None = None
+
+    def warm_up(self, ack_text: str = "Yes?") -> None:
+        """Load the speech models now so the first wake-up has no delay.
+
+        Both models load lazily on first use, which otherwise stalls the
+        first acknowledgement for seconds -- long enough for the user to
+        finish asking before the assistant starts listening. The spoken
+        acknowledgement is synthesized once here and replayed on each wake.
+        """
+        if self._warmed:
+            return
+        self._warmed = True
+        import io
+        import wave
+
+        stt = self.get_stt_backend()
+        if stt is not None:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(bytes(16000))  # 0.5 s of silence
+            try:
+                stt.transcribe(
+                    buf.getvalue(), format="wav", language=self.get_stt_language()
+                )
+            except Exception:
+                pass  # surfaced on the first real transcription instead
+
+        tts = self.get_tts_backend()
+        if tts is not None:
+            try:
+                voice_id, speed = self.voice_for_backend(tts)
+                kwargs: dict[str, Any] = {"output_format": "wav", "speed": speed}
+                if voice_id:
+                    kwargs["voice_id"] = voice_id
+                result = tts.synthesize(ack_text, **kwargs)
+                if result.audio:
+                    self.ack_audio = (result.audio, result.sample_rate)
+            except Exception:
+                pass  # speak() falls back to the next backend when used
 
     def get_stt_backend(self) -> Any:
         """Resolve and health-check STT once, then reuse the loaded backend."""
@@ -229,11 +274,18 @@ def listen_for_wake_word(
         )
         return VOICE_EXIT
 
-    console.print(
-        f"[dim cyan]Standby: say '{_terminal_safe_text(wake_word)}' "
-        "to wake me (Ctrl+C to quit).[/dim cyan]"
-    )
+    if not session._warmed:
+        console.print("[dim]Getting ready (loading speech models)...[/dim]")
+        session.warm_up()
+
+    announce = True
     while True:
+        if announce:
+            console.print(
+                f"[dim cyan]Standby: say '{_terminal_safe_text(wake_word)}' "
+                "to wake me (Ctrl+C to quit).[/dim cyan]"
+            )
+            announce = False
         try:
             audio_bytes = record_until_silence(wait_for_speech=True)
         except KeyboardInterrupt:
@@ -257,10 +309,19 @@ def listen_for_wake_word(
             console.print(f"[bold]You (voice):[/bold] {_terminal_safe_text(request)}")
             return request
 
-        speak("Yes?", console, session)
+        if session.ack_audio is not None:
+            from openjarvis.speech.voice_io import play_wav
+
+            try:
+                play_wav(session.ack_audio[0], sample_rate=session.ack_audio[1])
+            except Exception:
+                speak("Yes?", console, session)
+        else:
+            speak("Yes?", console, session)
         follow_up = record_voice(console, session)
-        if follow_up is not None:
+        if follow_up is VOICE_EXIT or follow_up:
             return follow_up
+        announce = True  # nothing usable heard; say we're waiting again
 
 
 def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
