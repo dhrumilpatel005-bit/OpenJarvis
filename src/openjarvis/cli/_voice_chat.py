@@ -82,11 +82,7 @@ class VoiceSession:
         tts = self.get_tts_backend()
         if tts is not None:
             try:
-                voice_id, speed = self.voice_for_backend(tts)
-                kwargs: dict[str, Any] = {"output_format": "wav", "speed": speed}
-                if voice_id:
-                    kwargs["voice_id"] = voice_id
-                result = tts.synthesize(ack_text, **kwargs)
+                result = tts.synthesize(ack_text, **self.synth_kwargs(tts))
                 if result.audio:
                     self.ack_audio = (result.audio, result.sample_rate)
             except Exception:
@@ -130,6 +126,34 @@ class VoiceSession:
             config = self._config if self._config is not None else load_config()
             self._voice_prefs = voice_preferences(config)
         return self._voice_prefs
+
+    def get_voice_pitch(self) -> float:
+        """Return the configured playback pitch, clamped to 0.5-1.5."""
+        from openjarvis.core.config import load_config
+
+        config = self._config if self._config is not None else load_config()
+        try:
+            pitch = float(getattr(config.speech, "voice_pitch", 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        if pitch != pitch:  # NaN
+            return 1.0
+        return min(1.5, max(0.5, pitch))
+
+    def synth_kwargs(self, backend: Any, console: Any = None) -> dict[str, Any]:
+        """Synthesis arguments for *backend*, pre-compensated for pitch.
+
+        Pitch is applied by changing the playback rate, which also changes the
+        pace; synthesizing at ``speed / pitch`` cancels that out.
+        """
+        voice_id, speed = self.voice_for_backend(backend, console)
+        kwargs: dict[str, Any] = {
+            "output_format": "wav",
+            "speed": speed / self.get_voice_pitch(),
+        }
+        if voice_id:
+            kwargs["voice_id"] = voice_id
+        return kwargs
 
     def voice_for_backend(self, backend: Any, console: Any = None) -> tuple[str, float]:
         """Return the voice ID valid for ``backend``, plus the configured speed.
@@ -313,7 +337,11 @@ def listen_for_wake_word(
             from openjarvis.speech.voice_io import play_wav
 
             try:
-                play_wav(session.ack_audio[0], sample_rate=session.ack_audio[1])
+                play_wav(
+                    session.ack_audio[0],
+                    sample_rate=session.ack_audio[1],
+                    rate_scale=session.get_voice_pitch(),
+                )
             except Exception:
                 speak("Yes?", console, session)
         else:
@@ -340,13 +368,15 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
 
     while (backend := active_session.get_tts_backend()) is not None:
         try:
-            voice_id, speed = active_session.voice_for_backend(backend, console)
-            synth_kwargs: dict[str, Any] = {"output_format": "wav", "speed": speed}
-            if voice_id:
-                synth_kwargs["voice_id"] = voice_id
-            result = backend.synthesize(text, **synth_kwargs)
+            result = backend.synthesize(
+                text, **active_session.synth_kwargs(backend, console)
+            )
             if result.audio:
-                play_wav(result.audio, sample_rate=result.sample_rate)
+                play_wav(
+                    result.audio,
+                    sample_rate=result.sample_rate,
+                    rate_scale=active_session.get_voice_pitch(),
+                )
             return
         except Exception as exc:
             console.print(

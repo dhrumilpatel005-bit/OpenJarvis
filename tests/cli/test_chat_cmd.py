@@ -869,7 +869,7 @@ class TestWakeWord:
 
         assert tts.synthesize.call_count == 1
         assert tts.synthesize.call_args.args[0] == "Yes?"
-        play.assert_called_once_with(b"yes-wav", sample_rate=24000)
+        play.assert_called_once_with(b"yes-wav", sample_rate=24000, rate_scale=1.0)
         speak_mock.assert_not_called()
 
     def test_silent_follow_up_returns_to_announced_standby(self) -> None:
@@ -933,3 +933,40 @@ class TestWakeWord:
         assert "Standby mode ON" in result.output
         assert listen.call_args.args[2] == "Friday"
         read_input.assert_not_called()
+
+
+class TestVoicePitch:
+    """speech.voice_pitch deepens playback without changing the pace."""
+
+    @staticmethod
+    def _speak_with_pitch(pitch):
+        config = JarvisConfig()
+        config.speech.voice_pitch = pitch
+        config.speech.voice_speed = 1.0
+        session = VoiceSession(config)
+        tts = MagicMock(backend_id="kokoro")
+        tts.synthesize.return_value = SimpleNamespace(audio=b"wav", sample_rate=24000)
+        with (
+            patch(
+                "openjarvis.speech._tts_discovery.get_tts_backend",
+                return_value=tts,
+            ),
+            patch("openjarvis.speech.voice_io.play_wav") as play,
+        ):
+            speak("I am vengeance.", MagicMock(), session)
+        return tts.synthesize.call_args.kwargs, play.call_args.kwargs
+
+    def test_lower_pitch_slows_playback_and_speeds_synthesis(self) -> None:
+        synth, play = self._speak_with_pitch(0.8)
+        assert play["rate_scale"] == pytest.approx(0.8)
+        # Synthesized 1.25x faster so the slowed playback keeps normal pace.
+        assert synth["speed"] == pytest.approx(1.25)
+
+    @pytest.mark.parametrize(
+        ("pitch", "expected"),
+        [(1.0, 1.0), (0.1, 0.5), (3.0, 1.5), ("deep", 1.0), (float("nan"), 1.0)],
+    )
+    def test_pitch_is_clamped_and_validated(self, pitch, expected) -> None:
+        config = JarvisConfig()
+        config.speech.voice_pitch = pitch
+        assert VoiceSession(config).get_voice_pitch() == pytest.approx(expected)

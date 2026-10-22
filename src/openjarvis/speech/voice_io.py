@@ -108,11 +108,14 @@ def _frames_to_wav(frames: list[bytes], sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def play_wav(audio: bytes, sample_rate: int = 24000) -> None:
+def play_wav(
+    audio: bytes, sample_rate: int = 24000, *, rate_scale: float = 1.0
+) -> None:
     """Play raw WAV bytes through the default output device.
 
     If the bytes are a valid WAV file, sample rate is read from the header;
-    otherwise ``sample_rate`` is used as a fallback.
+    otherwise ``sample_rate`` is used as a fallback. ``rate_scale`` plays the
+    audio faster (>1) or slower (<1), raising or lowering its pitch.
     """
     try:
         import numpy as np
@@ -137,7 +140,7 @@ def play_wav(audio: bytes, sample_rate: int = 24000) -> None:
         )
         sr = sample_rate
 
-    sd.play(data, sr)
+    sd.play(data, max(1, int(round(sr * rate_scale))))
     sd.wait()
 
 

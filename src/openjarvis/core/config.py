@@ -1636,6 +1636,9 @@ class SpeechConfig:
     tts_backend: str = "kokoro"  # "kokoro", "openai_tts", "cartesia"
     voice_id: str = "bm_george"
     voice_speed: float = 1.0
+    # Playback pitch multiplier for spoken replies (0.5-1.5). Below 1 sounds
+    # deeper, e.g. 0.8 for a gravelly voice; speaking pace is preserved.
+    voice_pitch: float = 1.0
 
 
 @dataclass(slots=True)
